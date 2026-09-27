@@ -937,6 +937,15 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     margin:0;
   }
 
+  /* Income rows carry a single fixed category, shown as a locked control. */
+  .cat-select.is-income{
+    color:var(--credit);
+    font-weight:600;
+    opacity:1;
+    cursor:default;
+    border-style:dashed;
+  }
+
   /* PDF security options */
   .pdf-options{
     margin-top:22px;
@@ -1107,7 +1116,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
   <section id="input-section">
     <div class="section-head"><h2>Add Your Transactions</h2></div>
-    <p class="hint">Upload your bank or UPI statement. ClariFi will automatically organise your transactions and identify where your money goes - detecting the correct reporting period straight from your own statement dates. PDF text is extracted right here in the browser; the file is never uploaded anywhere.</p>
+    <p class="hint">Upload your bank or UPI statement. ClariFi will automatically organise your transactions and identify where your money goes - detecting the correct reporting period straight from your own statement dates. Password-protected bank PDFs are supported - ClariFi will ask you for the password and use it on your device only. PDF text is extracted right here in the browser; the file is never uploaded anywhere.</p>
     <div class="input-box">
       <textarea id="raw-input" placeholder="e.g.
 03/08/2026  UPI-SWIGGY BANGALORE-swiggy@ybl  Rs.340.00 Dr
@@ -1651,7 +1660,11 @@ function registerPdfFont(doc){
   }
 }
 
+// Categories for money going out. Money coming in is not broken down this way -
+// every credit is simply Income, so received amounts never get mixed into the
+// spending breakdown.
 const CATEGORIES = ["Food & Dining","Transport","Groceries","Shopping","Bills & Utilities","Entertainment","Health","Rent","Transfers","Others"];
+const INCOME_CATEGORY = "Income";
 
 let rules = [
   {keywords:"swiggy, zomato, dominos, mcdonald, kfc, faasos, box8, eatfit", category:"Food & Dining"},
@@ -1677,8 +1690,10 @@ if(window.pdfjsLib){
 }
 
 // Extract text from a PDF, reconstructing rows by grouping text items that share a y-position.
-async function extractPdfText(arrayBuffer){
-  const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+async function extractPdfText(arrayBuffer, password){
+  const params = {data: arrayBuffer};
+  if(password) params.password = password;
+  const pdf = await pdfjsLib.getDocument(params).promise;
   let fullText = '';
   for(let p = 1; p <= pdf.numPages; p++){
     const page = await pdf.getPage(p);
@@ -1696,6 +1711,46 @@ async function extractPdfText(arrayBuffer){
     });
   }
   return fullText;
+}
+
+// Many Indian banks email statements locked with a password (often a mix of
+// name, date of birth or account digits). This opens such a file by asking the
+// user for that password and retrying.
+//
+// The password is used to decrypt the file in this browser and is never stored
+// or transmitted - there is nowhere for it to be sent.
+async function extractPdfTextMaybeLocked(arrayBuffer, onStatus){
+  let password = null;
+  for(let attempt = 0; attempt < 5; attempt++){
+    try{
+      // pdf.js may detach the buffer, so hand it a fresh copy each attempt.
+      return await extractPdfText(arrayBuffer.slice(0), password);
+    } catch(err){
+      const isPasswordIssue = err && (err.name === 'PasswordException' ||
+        /password/i.test(err.message || ''));
+      if(!isPasswordIssue) throw err;
+
+      const wrongAlready = password !== null;
+      if(onStatus) onStatus(wrongAlready
+        ? 'That password did not work. Trying again...'
+        : 'This statement is password protected.');
+
+      const entered = window.prompt(
+        (wrongAlready
+          ? 'That password did not open the statement. Please try again.'
+          : 'This PDF is password protected.') +
+        '\n\nEnter the password your bank uses for this statement.' +
+        '\nIt is used only on this device and is never stored or sent anywhere.'
+      );
+      if(entered === null){
+        const cancelled = new Error('PASSWORD_CANCELLED');
+        cancelled.cancelled = true;
+        throw cancelled;
+      }
+      password = entered;
+    }
+  }
+  throw new Error('PASSWORD_FAILED');
 }
 
 function el(id){return document.getElementById(id);}
@@ -1777,6 +1832,7 @@ function predictCategory(description){
 function learnFromStatement(txs){
   const tally = {};
   txs.forEach(t=>{
+    if(t.type === 'credit') return; // income is not categorised by merchant
     const key = normalizeMerchant(t.description);
     if(!key || key === 'unlabelled') return;
     tally[key] = tally[key] || {};
@@ -1812,7 +1868,9 @@ loadMerchantMemory();
 // How many merchants ClariFi currently recognises.
 function knownMerchantCount(){ return Object.keys(merchantMemory).length; }
 
-function categorize(description){
+function categorize(description, type){
+  // Money in is always Income. Expense categories never apply to a credit.
+  if(type === 'credit') return INCOME_CATEGORY;
   // A category the user has already chosen for this merchant wins over the
   // generic keyword rules, because it reflects a deliberate decision.
   const learned = predictCategory(description);
@@ -1826,7 +1884,7 @@ function categorize(description){
 }
 
 function recategorizeAll(){
-  transactions.forEach(t=>{ t.category = categorize(t.description); });
+  transactions.forEach(t=>{ t.category = categorize(t.description, t.type); });
   renderLedger();
   renderSummary();
 }
@@ -1841,11 +1899,38 @@ function parseAmount(str){
   return isNaN(num) ? null : num;
 }
 
+// Works out whether a line is money in or money out.
+//
+// Statements label this very differently: a trailing "Dr"/"Cr", the full words
+// DEBIT/CREDIT, "credited to"/"debited from", "deposit"/"withdrawal", or a plus
+// or minus sign. An earlier version only matched "credited" and so missed plain
+// "CREDIT", which caused income to be counted as spending. This checks the
+// explicit marker at the end of the line first, since that is the bank's own
+// statement of direction, and only then falls back to wording.
 function detectType(line){
-  const l = line.toLowerCase();
-  if(/\bcr\b|credited|received|refund/.test(l)) return 'credit';
-  if(/\bdr\b|debited|paid|withdrawn/.test(l)) return 'debit';
-  return 'debit'; // default assumption for UPI outflow
+  const l = ' ' + String(line).toLowerCase().replace(/[^a-z0-9+\-.,@ ]/g, ' ') + ' ';
+
+  // 1. An explicit Dr/Cr or DEBIT/CREDIT marker. The LAST one on the line wins,
+  //    because that is normally the amount column's own label.
+  const markers = [...l.matchAll(/\b(cr|dr|credit|debit|credited|debited)\b/g)];
+  if(markers.length){
+    const last = markers[markers.length - 1][1];
+    return (last === 'cr' || last === 'credit' || last === 'credited') ? 'credit' : 'debit';
+  }
+
+  // 2. Wording that states the direction.
+  if(/\b(deposit|deposited|received|refund|refunded|inward|cash in|money in|salary|interest|cashback|reversal|reversed)\b/.test(l)) return 'credit';
+  if(/\b(withdrawal|withdrawn|withdraw|paid|payment to|sent to|purchase|outward|cash out|money out|charge|charges|fee)\b/.test(l)) return 'debit';
+
+  // 3. A signed amount.
+  if(/\+\s?(rs|inr|\d)/.test(l)) return 'credit';
+  if(/-\s?(rs|inr|\d)/.test(l)) return 'debit';
+
+  // 4. "from X" is money in; "to X" is money out.
+  if(/\bfrom\b/.test(l)) return 'credit';
+  if(/\bto\b/.test(l)) return 'debit';
+
+  return 'debit'; // most UPI lines are outflows
 }
 
 const MONTH_NAMES = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
@@ -2003,6 +2088,12 @@ function parseCSVBased(text){
 
   if(!descField || (!debitField && !creditField && !amountField)) return null;
 
+  // Does this file use minus signs to show direction? If it does, unsigned rows
+  // can be read as credits; if every figure is positive, they are all expenses.
+  const hasNegativeAmounts = amountField
+    ? parsed.data.some(r=>{ const v = parseAmount(r[amountField]); return v !== null && v < 0; })
+    : false;
+
   const results = [];
   parsed.data.forEach(row=>{
     const date = dateField ? row[dateField] : '';
@@ -2011,16 +2102,29 @@ function parseCSVBased(text){
 
     let amount = null, type = 'debit';
     if(debitField || creditField){
+      // Separate Debit and Credit columns: whichever holds a value decides.
       const debitVal = debitField ? parseAmount(row[debitField]) : null;
       const creditVal = creditField ? parseAmount(row[creditField]) : null;
-      if(debitVal){ amount = debitVal; type='debit'; }
-      else if(creditVal){ amount = creditVal; type='credit'; }
+      if(debitVal){ amount = Math.abs(debitVal); type='debit'; }
+      else if(creditVal){ amount = Math.abs(creditVal); type='credit'; }
     } else if(amountField){
       amount = parseAmount(row[amountField]);
-      if(typeField){
-        type = /cr/i.test(row[typeField]) ? 'credit' : 'debit';
-      } else if(amount < 0){
-        type = 'credit'; amount = Math.abs(amount);
+      const typeVal = typeField ? String(row[typeField]||'') : '';
+      if(typeVal.trim()){
+        // An explicit Dr/Cr or Debit/Credit column.
+        type = /^\s*(cr|credit)/i.test(typeVal.trim()) ? 'credit' : 'debit';
+        amount = amount === null ? null : Math.abs(amount);
+      } else if(amount !== null && amount < 0){
+        // A single signed Amount column. A minus sign means money LEAVING the
+        // account, so a negative figure is a debit. This was previously inverted,
+        // which made money received appear as spending and vice versa.
+        type = 'debit'; amount = Math.abs(amount);
+      } else if(amount !== null && amount > 0 && hasNegativeAmounts){
+        // Only treat positive rows as income when the file actually uses signs
+        // to distinguish direction; otherwise every row here is an expense.
+        type = 'credit';
+      } else {
+        type = detectType(description);
       }
     }
     if(amount===null || amount===0) return;
@@ -2052,9 +2156,13 @@ function renderLedger(){
       <td>${undated ? '<span class="date-missing" title="No readable date - not counted in totals">No date</span>' : t.date}</td>
       <td>${t.description}</td>
       <td>
-        <select data-idx="${i}" class="cat-select">
-          ${CATEGORIES.map(c=>`<option value="${c}" ${c===t.category?'selected':''}>${c}</option>`).join('')}
-        </select>
+        ${t.type === 'credit'
+          ? `<select class="cat-select is-income" disabled title="Money received is always recorded as Income">
+               <option selected>${INCOME_CATEGORY}</option>
+             </select>`
+          : `<select data-idx="${i}" class="cat-select">
+               ${CATEGORIES.map(c=>`<option value="${c}" ${c===t.category?'selected':''}>${c}</option>`).join('')}
+             </select>`}
       </td>
       <td class="num ${t.type==='debit'?'amt-debit':'amt-credit'}">${t.type==='debit'?'-':'+'}₹${t.amount.toLocaleString('en-IN')}</td>
     `;
@@ -2517,11 +2625,11 @@ function runParse(text){
     showSections(false);
     return;
   }
-  transactions = results.map(t=>({...t, category: categorize(t.description), ...buildDateFields(t.date)}));
+  transactions = results.map(t=>({...t, category: categorize(t.description, t.type), ...buildDateFields(t.date)}));
   // Adopt repeated payees from this statement so the same shop is treated
   // consistently, then re-apply so every row reflects the settled category.
   learnFromStatement(transactions);
-  transactions.forEach(t=>{ if(!t.userSet) t.category = categorize(t.description); });
+  transactions.forEach(t=>{ if(!t.userSet) t.category = categorize(t.description, t.type); });
   const dated = transactions.filter(t=>t.dateObj).length;
   const undated = transactions.length - dated;
   msg.textContent = `Found ${transactions.length} transaction${transactions.length===1?'':'s'}.` +
@@ -2549,17 +2657,28 @@ el('file-input').addEventListener('change', (e)=>{
     const reader = new FileReader();
     reader.onload = async (ev)=>{
       try{
-        const text = await extractPdfText(ev.target.result);
+        const text = await extractPdfTextMaybeLocked(ev.target.result, (status)=>{
+          msg.textContent = status;
+          msg.className = 'msg';
+        });
         if(!text.trim()){
-          msg.textContent = "Couldn't extract any text from that PDF — it may be a scanned image rather than a text-based statement. Try exporting a CSV instead.";
+          msg.textContent = "Couldn't extract any text from that PDF. It may be a scanned image rather than a text-based statement. Try exporting a CSV or TXT statement instead.";
           msg.className = 'msg error';
           return;
         }
         el('raw-input').value = text;
         runParse(text);
       } catch(err){
-        msg.textContent = "Couldn't read that PDF (it may be password-protected). Try removing the password or use a CSV export instead.";
-        msg.className = 'msg error';
+        if(err && err.cancelled){
+          msg.textContent = 'Cancelled. The statement was not opened.';
+          msg.className = 'msg';
+        } else if(err && err.message === 'PASSWORD_FAILED'){
+          msg.textContent = "That password didn't work. Bank statement passwords are often a combination of your name, date of birth or account number - check the email the statement came with.";
+          msg.className = 'msg error';
+        } else {
+          msg.textContent = "Couldn't read that PDF. Try a CSV or TXT export of the same statement instead.";
+          msg.className = 'msg error';
+        }
       }
     };
     reader.readAsArrayBuffer(file);
